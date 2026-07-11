@@ -304,6 +304,43 @@ class ModelBase:
             logger.info(f"  + {scale_name} (per-expert scale, shape [{len(scales)}])")
             self.gguf_writer.add_tensor(scale_name, scale_vals)
 
+    @staticmethod
+    def _get_compressed_tensors_group(groups: dict[str, Any], weight_name: str) -> dict[str, Any] | None:
+        """Return the highest-priority compressed-tensors group for a weight."""
+        module_name = weight_name.removesuffix(".weight")
+        matches: list[tuple[tuple[bool, str], dict[str, Any]]] = []
+
+        for group in groups.values():
+            if not isinstance(group, dict):
+                continue
+            targets = group.get("targets") or []
+            if isinstance(targets, str):
+                targets = [targets]
+            if not isinstance(targets, list):
+                continue
+
+            for target in targets:
+                if not isinstance(target, str):
+                    continue
+                if target.startswith("re:"):
+                    matched = re.match(target.removeprefix("re:"), module_name) is not None
+                else:
+                    matched = target == module_name
+                if matched:
+                    # Match compressed-tensors precedence: exact, then regex.
+                    matches.append(((target.startswith("re:"), target), group))
+
+        if not matches:
+            return None
+
+        matches.sort(key=lambda item: item[0])
+        best_priority, best_group = matches[0]
+        if any(group is not best_group for priority, group in matches if priority == best_priority):
+            raise NotImplementedError(
+                f"Ambiguous compressed-tensors config groups for {weight_name!r}"
+            )
+        return best_group
+
     def dequant_model(self):
         # If all quantized tensors were already handled (e.g. pure NVFP4), skip
         if self._is_nvfp4 and not any(k.endswith((".weight_scale", ".weight_scale_inv")) for k in self.model_tensors):
@@ -479,18 +516,32 @@ class ModelBase:
             elif quant_method == "compressed-tensors":
                 quant_format = quant_config["format"]
                 groups = quant_config["config_groups"]
+                group_formats = {
+                    g.get("format") if isinstance(g, dict) else None
+                    for g in groups.values()
+                }
                 nvfp4_compressed_tensors = (
                     quant_format == "nvfp4-pack-quantized"
-                    or quant_format == "mixed-precision"
-                    and bool(groups)
-                    and all(g.get("format") == "nvfp4-pack-quantized" for g in groups.values() if isinstance(g, dict))
+                    or (
+                        quant_format == "mixed-precision"
+                        and group_formats == {"nvfp4-pack-quantized"}
+                    )
+                )
+                mixed_nvfp4_fp8_compressed_tensors = (
+                    quant_format == "mixed-precision"
+                    and group_formats == {
+                        "float-quantized",
+                        "nvfp4-pack-quantized",
+                    }
                 )
 
-                if len(groups) > 1 and not nvfp4_compressed_tensors:
+                if len(groups) > 1 and not (
+                    nvfp4_compressed_tensors or mixed_nvfp4_fp8_compressed_tensors
+                ):
                     raise NotImplementedError("Can't handle multiple config groups for compressed-tensors yet")
-                weight_config = tuple(groups.values())[0]["weights"]
 
                 if quant_format == "float-quantized" or quant_format == "int-quantized" or quant_format == "naive-quantized":
+                    weight_config = tuple(groups.values())[0]["weights"]
                     block_size = weight_config.get("block_structure", None)
                     strategy = weight_config.get("strategy")
                     assert strategy == "channel" or strategy == "block"
@@ -510,6 +561,7 @@ class ModelBase:
                             if self._fp8_as_q8 and is_fp8:
                                 self._fp8_dequantized.add(weight_name)
                 elif quant_format == "pack-quantized":
+                    weight_config = tuple(groups.values())[0]["weights"]
                     assert weight_config.get("strategy") == "group"
                     assert weight_config.get("type", "int") == "int"
                     num_bits = weight_config.get("num_bits")
@@ -531,6 +583,46 @@ class ModelBase:
                             tensors_to_remove += [base_name + n for n in ("_packed", "_shape", "_scale")]
                             if (base_name + "_zero_point") in self.model_tensors:
                                 tensors_to_remove.append(base_name + "_zero_point")
+                elif mixed_nvfp4_fp8_compressed_tensors:
+                    # _generate_nvfp4_tensors has already consumed the NVFP4 tensors.
+                    # Dequantize remaining tensors using their matching FP8 config.
+                    for name in self.model_tensors.keys():
+                        if name.endswith(".weight_scale"):
+                            weight_name = name.removesuffix("_scale")
+                            if weight_name not in self.model_tensors:
+                                tensors_to_remove.append(name)
+                                continue
+                            group = self._get_compressed_tensors_group(groups, weight_name)
+                            if group is None:
+                                raise NotImplementedError(
+                                    f"No compressed-tensors config group matches {weight_name!r}"
+                                )
+                            if group.get("format") != "float-quantized":
+                                raise NotImplementedError(
+                                    f"NVFP4 tensor {weight_name!r} was not repacked"
+                                )
+
+                            weight_config = group.get("weights")
+                            if not isinstance(weight_config, dict):
+                                raise NotImplementedError(
+                                    f"Missing float-quantized weights config for {weight_name!r}"
+                                )
+                            block_size = weight_config.get("block_structure", None)
+                            strategy = weight_config.get("strategy")
+                            assert strategy == "channel" or strategy == "block"
+                            assert weight_config.get("group_size") is None
+                            is_fp8 = (
+                                weight_config.get("type") == "float"
+                                and weight_config.get("num_bits") == 8
+                            )
+                            w = self.model_tensors[weight_name]
+                            s = self.model_tensors[name]
+                            self.model_tensors[weight_name] = (
+                                lambda w=w, s=s, bs=block_size: dequant_simple(w(), s(), bs)
+                            )
+                            tensors_to_remove.append(name)
+                            if self._fp8_as_q8 and is_fp8:
+                                self._fp8_dequantized.add(weight_name)
                 elif nvfp4_compressed_tensors:
                     # Don't error from compressed-tensors, we'll handle them in _generate_nvfp4_tensors
                     pass
@@ -695,6 +787,17 @@ class ModelBase:
         expert_shapes: dict[tuple[int, str], list[int]] = {}
         n_experts = self.find_hparam(["num_local_experts", "num_experts"], optional=True) or 0
         consumed: list[str] = []
+        quant_config = self.hparams.get("quantization_config") or {}
+        compressed_tensors_groups = quant_config.get("config_groups") or {}
+        mixed_compressed_tensors = (
+            quant_config.get("quant_method") == "compressed-tensors"
+            and quant_config.get("format") == "mixed-precision"
+            and {
+                group.get("format") if isinstance(group, dict) else None
+                for group in compressed_tensors_groups.values()
+            }
+            == {"float-quantized", "nvfp4-pack-quantized"}
+        )
 
         for name in self.model_tensors.keys():
             if not name.endswith(".weight"):
@@ -704,13 +807,23 @@ class ModelBase:
             input_scale_name = name.replace(".weight", ".input_scale")
             if scale_name not in self.model_tensors:
                 continue
-            # Force eager materialization of lazy tensors
-            weight = LazyTorchTensor.to_eager(self.model_tensors[name]())
+            if mixed_compressed_tensors:
+                group = self._get_compressed_tensors_group(compressed_tensors_groups, name)
+                if group is None:
+                    raise NotImplementedError(
+                        f"No compressed-tensors config group matches {name!r}"
+                    )
+                if group.get("format") != "nvfp4-pack-quantized":
+                    continue
+            # Read the scale first so mixed FP8/NVFP4 checkpoints do not
+            # materialize every FP8 weight during the NVFP4 prepass.
             scale = LazyTorchTensor.to_eager(self.model_tensors[scale_name]())
 
             # Skip non-NVFP4 tensors (e.g. FP8 with per-channel 1D scales)
             if scale.ndim < 2:
                 continue
+
+            weight = LazyTorchTensor.to_eager(self.model_tensors[name]())
 
             scale2 = LazyTorchTensor.to_eager(self.model_tensors.get(scale2_name, lambda: torch.tensor(1.0))())
             input_scale = LazyTorchTensor.to_eager(self.model_tensors.get(input_scale_name, lambda: torch.tensor(1.0))())
@@ -811,14 +924,27 @@ class ModelBase:
 
         # Some models use per-tensor quant_algo (e.g. "MIXED_PRECISION" with
         # per-layer NVFP4/FP8) instead of a single global "NVFP4" value.
+        quant_group_formats = {
+            g.get("format") if isinstance(g, dict) else None
+            for g in quant_groups.values()
+        }
         nvfp4_compressed_tensors = quant_method == "compressed-tensors" and (
             quant_format == "nvfp4-pack-quantized"
-            or quant_format == "mixed-precision"
-            and bool(quant_groups)
-            and all(g.get("format") == "nvfp4-pack-quantized" for g in quant_groups.values() if isinstance(g, dict))
+            or (
+                quant_format == "mixed-precision"
+                and quant_group_formats == {"nvfp4-pack-quantized"}
+            )
         )
+        mixed_nvfp4_fp8_compressed_tensors = quant_method == "compressed-tensors" and (
+            quant_format == "mixed-precision"
+            and quant_group_formats == {
+                "float-quantized",
+                "nvfp4-pack-quantized",
+            }
+        )
+        has_nvfp4_compressed_tensors = nvfp4_compressed_tensors or mixed_nvfp4_fp8_compressed_tensors
         if quant_algo != "NVFP4":
-            if nvfp4_compressed_tensors:
+            if has_nvfp4_compressed_tensors:
                 quant_algo = "NVFP4"
             elif any(str(v.get("quant_algo")).endswith("NVFP4") for v in quant_layers.values() if isinstance(v, dict)):
                 quant_algo = "NVFP4"
@@ -830,7 +956,7 @@ class ModelBase:
         # This must run before dequant_model so NVFP4 tensors are removed
         # from model_tensors, leaving only non-NVFP4 (e.g. FP8) for dequant.
         if self._is_nvfp4:
-            if nvfp4_compressed_tensors:
+            if has_nvfp4_compressed_tensors:
                 # Convert compressed-tensors 'global' scales into the reciprocal
                 def inverse_scale(gen):
                     def load():
