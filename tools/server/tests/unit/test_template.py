@@ -57,6 +57,43 @@ def test_reasoning(template_name: str, reasoning: Literal['on', 'off', 'auto'] |
     assert prompt.endswith(expected_end), f"Expected prompt to end with '{expected_end}', got '{prompt}'"
 
 
+@pytest.mark.parametrize("reasoning,request_body,expected", [
+    ("off",  {"reasoning_effort": "high"}, "high|high|true"),
+    ("on",   {"reasoning_effort": "none"}, "none|unset|false"),
+    ("off",  {"reasoning": {"effort": "low"}}, "low|low|true"),
+    ("off",  {"reasoning_effort": "minimal"}, "minimal|low|true"),
+    ("off",  {"reasoning_effort": "max"}, "max|xhigh|true"),
+    ("off",  {
+        "reasoning_effort": "high",
+        "reasoning": {"effort": "low"},
+    }, "high|high|true"),
+    ("off",  {
+        "reasoning_effort": "high",
+        "chat_template_kwargs": {
+            "enable_thinking": False,
+            "reasoning_strength": "xhigh",
+        },
+    }, "high|xhigh|false"),
+])
+def test_reasoning_effort_compatibility(reasoning: Literal['on', 'off'], request_body: dict, expected: str):
+    global server
+    server.jinja = True
+    server.reasoning = reasoning
+    server.chat_template = (
+        "{{ reasoning_effort if reasoning_effort is defined else 'unset' }}|"
+        "{{ reasoning_strength if reasoning_strength is defined else 'unset' }}|"
+        "{{ 'true' if enable_thinking else 'false' }}"
+    )
+    server.start()
+
+    res = server.make_request("POST", "/apply-template", data={
+        "messages": [{"role": "user", "content": "What is today?"}],
+        **request_body,
+    })
+    assert res.status_code == 200
+    assert res.body["prompt"] == expected
+
+
 @pytest.mark.parametrize("tools", [None, [], [TEST_TOOL]])
 @pytest.mark.parametrize("template_name,format", [
     ("meta-llama-Llama-3.3-70B-Instruct",    "%d %b %Y"),

@@ -1069,9 +1069,40 @@ json oaicompat_chat_params_parse(
         llama_params["parse_tool_calls"] = true;
     }
 
-    // merge the template args provided from command line with the args provided in the user request
-    auto chat_template_kwargs_object = json_value(body, "chat_template_kwargs", json::object());
+    // Merge template args in increasing precedence: server defaults, portable
+    // reasoning controls, then backend-native request overrides.
     inputs.chat_template_kwargs = opt.chat_template_kwargs;
+
+    // Normalize OpenAI's top-level reasoning_effort and OpenRouter's nested
+    // reasoning.effort into the template context. Any non-none effort enables
+    // thinking; templates that support effort levels can consume the original
+    // value. Muse Glimmer calls the same concept reasoning_strength, so expose
+    // the corresponding supported tier as well.
+    auto reasoning_effort = std::string();
+    if (body.contains("reasoning_effort")) {
+        reasoning_effort = json_value(body, "reasoning_effort", std::string());
+    } else {
+        auto reasoning = json_value(body, "reasoning", json::object());
+        reasoning_effort = json_value(reasoning, "effort", std::string());
+    }
+    if (!reasoning_effort.empty()) {
+        inputs.enable_thinking = reasoning_effort != "none";
+        inputs.chat_template_kwargs["enable_thinking"] = inputs.enable_thinking ? "true" : "false";
+        inputs.chat_template_kwargs["reasoning_effort"] = json(reasoning_effort).dump();
+
+        auto reasoning_strength = reasoning_effort;
+        if (reasoning_strength == "minimal") {
+            reasoning_strength = "low";
+        } else if (reasoning_strength == "max") {
+            reasoning_strength = "xhigh";
+        }
+        if (reasoning_strength == "low" || reasoning_strength == "medium" ||
+            reasoning_strength == "high" || reasoning_strength == "xhigh") {
+            inputs.chat_template_kwargs["reasoning_strength"] = json(reasoning_strength).dump();
+        }
+    }
+
+    auto chat_template_kwargs_object = json_value(body, "chat_template_kwargs", json::object());
     for (const auto & item : chat_template_kwargs_object.items()) {
         inputs.chat_template_kwargs[item.key()] = item.value().dump();
     }
@@ -1084,14 +1115,6 @@ json oaicompat_chat_params_parse(
         inputs.enable_thinking = false;
     } else if (!enable_thinking_kwarg.empty() && enable_thinking_kwarg[0] == '"') {
         throw std::invalid_argument("invalid type for \"enable_thinking\" (expected boolean, got string)");
-    }
-
-    // Parse also the OAI "reasoning_effort": "none" specific value
-    if (body.contains("reasoning_effort")) {
-        auto reasoning_effort = json_value(body, "reasoning_effort", std::string(""));
-        if (reasoning_effort == "none") {
-            inputs.enable_thinking = false;
-        } // other reasoning_effort values are model-specific and not yet handled
     }
 
     inputs.force_pure_content = opt.force_pure_content;
