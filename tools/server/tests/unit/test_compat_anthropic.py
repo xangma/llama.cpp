@@ -455,9 +455,8 @@ def test_anthropic_tool_result_with_image():
         ]
     })
 
-    # Without the fix, image block would cause "unsupported content[].type"
-    # With the fix, image is converted to image_url but tinyllama doesn't support images
-    assert res.status_code == 500
+    # Converted image_url content is a client error for this text-only model.
+    assert res.status_code == 400
     assert "image input is not supported" in res.body.get("error", {}).get("message", "").lower()
 
 
@@ -586,9 +585,8 @@ def test_anthropic_vision_format_accepted():
         ]
     })
 
-    # Server accepts the format but tinyllama doesn't support images
-    # So it should return 500 with clear error message about missing mmproj
-    assert res.status_code == 500
+    # Valid image content is a client error when the model has no vision projector.
+    assert res.status_code == 400
     assert "image input is not supported" in res.body.get("error", {}).get("message", "").lower()
 
 
