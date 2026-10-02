@@ -986,7 +986,7 @@ json oaicompat_chat_params_parse(
             std::string type = json_value(p, "type", std::string());
             if (type == "image_url") {
                 if (!opt.allow_image) {
-                    throw std::runtime_error("image input is not supported - hint: if this is unexpected, you may need to provide the mmproj");
+                    throw std::invalid_argument("image input is not supported - hint: if this is unexpected, you may need to provide the mmproj");
                 }
 
                 json image_url = json_value(p, "image_url", json::object());
